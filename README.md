@@ -95,9 +95,90 @@ The application was initially deployed and tested on a local Kubernetes cluster 
 ### ☁️ AWS EKS Deployment with EBS
 For a production-grade setup, the application is deployed on Amazon Elastic Kubernetes Service (EKS). 
 
-To ensure data persistence for our PostgreSQL database across pod restarts and failures, we configured an **AWS Elastic Block Store (EBS)** volume via Kubernetes Persistent Volume Claims (PVC). 
+**EKS Deployment Steps:**
 
-We utilized the **EBS CSI (Container Storage Interface) Driver** to allow Kubernetes to provision, manage, and attach EBS volumes dynamically for our stateful workloads on the EKS cluster.
+1. **Install Prerequisites & Configure AWS**
+   Ensure you have `aws-cli`, `eksctl`, and `kubectl` installed.
+   ```bash
+   aws configure
+   ```
+
+2. **Create EKS Cluster**
+   Create a cluster with 2 `t3.medium` nodes in the `ap-south-1` region.
+   *(Note: `t3.medium` instances are recommended here; smaller instances like `t3.small` may lack the necessary resources to run all application workloads and cluster add-ons smoothly.)*
+   ```bash
+   eksctl create cluster --name jerney-cluster --region ap-south-1 --nodegroup-name standard-workers --node-type t3.medium --nodes 2
+   ```
+
+3. **Configure EBS CSI Driver (For Persistent Storage)**
+   To ensure data persistence for our PostgreSQL database across pod restarts, we configure an AWS Elastic Block Store (EBS) volume.
+   ```bash
+   # Create an IAM OIDC provider for the cluster
+   eksctl utils associate-iam-oidc-provider --region ap-south-1 --cluster jerney-cluster --approve
+   
+   # Create IAM role and attach the EBS CSI policy
+   eksctl create iamserviceaccount \
+     --name ebs-csi-controller-sa \
+     --namespace kube-system \
+     --cluster jerney-cluster \
+     --attach-policy-arn arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy \
+     --approve \
+     --role-only \
+     --role-name AmazonEKS_EBS_CSI_DriverRole
+     
+   # Install the EBS CSI Driver as an EKS Add-on
+   eksctl create addon --name aws-ebs-csi-driver --cluster jerney-cluster --service-account-role-arn arn:aws:iam::$(aws sts get-caller-identity --query Account --output text):role/AmazonEKS_EBS_CSI_DriverRole --force
+   ```
+
+4. **Deploy the Application**
+   On EKS, use a `StorageClass` to dynamically provision EBS volumes instead of manually creating a `PersistentVolume` (`pv.yml`).
+   ```bash
+   kubectl apply -f kubernetes/namespace.yml
+   kubectl apply -f kubernetes/secrets.yml
+   
+   # Note: apply storageclass.yml instead of pv.yml for dynamic provisioning
+   kubectl apply -f kubernetes/storageclass.yml
+   kubectl apply -f kubernetes/pvc.yml
+   kubectl apply -f kubernetes/db-deployment.yml
+   kubectl apply -f kubernetes/db-service.yml
+   
+   kubectl apply -f kubernetes/backend-deployment.yml
+   kubectl apply -f kubernetes/backend-service.yml
+   kubectl apply -f kubernetes/frontend-deployment.yml
+   kubectl apply -f kubernetes/frontend-service.yml
+   ```
+
+5. **Install AWS Load Balancer Controller**
+   To securely expose our application to the internet, we configure an Application Load Balancer (ALB) via an Ingress resource.
+   ```bash
+   # Download the IAM policy for the AWS Load Balancer Controller
+   curl -O https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/v2.5.4/docs/install/iam_policy.json
+   aws iam create-policy --policy-name AWSLoadBalancerControllerIAMPolicy --policy-document file://iam_policy.json
+   
+   # Create a service account mapped to the IAM role
+   eksctl create iamserviceaccount \
+     --cluster=jerney-cluster \
+     --namespace=kube-system \
+     --name=aws-load-balancer-controller \
+     --role-name AmazonEKSLoadBalancerControllerRole \
+     --attach-policy-arn=arn:aws:iam::$(aws sts get-caller-identity --query Account --output text):policy/AWSLoadBalancerControllerIAMPolicy \
+     --approve
+     
+   # Install the controller using Helm
+   helm repo add eks https://aws.github.io/eks-charts
+   helm repo update eks
+   helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
+     -n kube-system \
+     --set clusterName=jerney-cluster \
+     --set serviceAccount.create=false \
+     --set serviceAccount.name=aws-load-balancer-controller
+   ```
+
+6. **Apply Ingress**
+   Finally, apply the Ingress rule to expose the frontend service externally.
+   ```bash
+   kubectl apply -f kubernetes/ingress.yml
+   ```
 
 ---
 
